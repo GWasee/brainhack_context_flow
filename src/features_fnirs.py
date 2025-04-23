@@ -1,71 +1,91 @@
 import pandas as pd
 import numpy as np
 from scipy import signal
-from sklearn.linear_model import LinearRegression
-import sys
 
 
-def extract_hr_from_fNIRS_with_timestamps(ppg_window, sampling_rate):
+def extract_fnirs_features(data_path):
     """
-    Extract heart rate features from raw fNIRS/PPG signal with timestamps.
-
+    Extract heart rate related features from FNIRS data
+    
     Parameters:
-    -----------
-    ppg_window : pd.DataFrame
-        DataFrame with 'timestamp' and 'ppg_signal' columns
-    sampling_rate : int
-        Sampling rate of the PPG/fNIRS signal in Hz
-
+    data_path (str): Path to the FNIRS data CSV file
+    
     Returns:
-    --------
-    dict
-        Dictionary of extracted HR features (mean, std, trend, etc.)
+    dict: Dictionary containing extracted features
     """
-    if len(ppg_window) < 2:
-        return None
-
-    timestamps = ppg_window['timestamp'].values
-    signal_values = ppg_window['ppg_signal'].values
-
-    # Bandpass filter for PPG (0.5–4 Hz)
-    sos = signal.butter(2, [0.5, 4.0], btype='bandpass', fs=sampling_rate, output='sos')
-    filtered = signal.sosfiltfilt(sos, signal_values)
-
-    # Detect peaks (heartbeats)
-    min_distance = int(sampling_rate * 0.4)  # 150 BPM max
-    peaks, _ = signal.find_peaks(filtered, distance=min_distance, prominence=0.1)
-
-    if len(peaks) < 1:
-        print("Not enough peaks detected.")
-        return None
-
-    # Convert peak times to BPM
-    beat_times = timestamps[peaks]
-    rr_intervals = np.diff(beat_times)  # seconds
-    bpm_values = 60 / rr_intervals
-
-    # Feature 1: Mean Heart Rate
-    hr_mean = np.mean(bpm_values)
-
-    # Feature 2: Heart Rate Standard Deviation
-    hr_std = np.std(bpm_values)
-
-    # Feature 3: HR Trend (Linear regression on BPM vs time)
-    # time_midpoints = (beat_times[1:] + beat_times[:-1]) / 2
-    X = timestamps.reshape(-1, 1)
-    y = bpm_values
-    model = LinearRegression().fit(X, y)
-    hr_trend = model.coef_[0]
-
-    # Feature 4: Max HR Delta
-    hr_diff = np.abs(np.diff(bpm_values))
-    hr_max_delta = np.max(hr_diff) if len(hr_diff) > 0 else 0
-
-    # Feature 5: RMSSD (HRV)
-    rr_ms = 60000 / bpm_values
-    rr_diff = np.diff(rr_ms)
-    rmssd = np.sqrt(np.mean(rr_diff**2)) if len(rr_diff) > 0 else 0
-
+    # Load the data
+    try:
+        df = pd.read_csv(data_path)
+    except:
+        # If reading fails, assume it's a string with comma-separated values
+        lines = data_path.strip().split('\n')
+        header = lines[0].split(',')
+        data = [line.split(',') for line in lines[1:]]
+        df = pd.DataFrame(data, columns=header)
+    
+    # Convert columns to appropriate types
+    df.columns = df.columns.str.strip()
+    numeric_cols = ['Red', 'IR', 'Ratio']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # Convert timestamp to milliseconds if needed
+    if 'us' in df.columns:
+        df['timestamp_ms'] = df['us'].astype(float) / 1000
+    elif 'ms' in df.columns:
+        df['timestamp_ms'] = df['ms'].astype(float)
+    else:
+        # Use the first column as timestamp if not labeled
+        df['timestamp_ms'] = pd.to_numeric(df.iloc[:, 0], errors='coerce') / 1000
+    
+    # Calculate time differences
+    df['time_diff'] = df['timestamp_ms'].diff()
+    
+    # Extract heart rate using peak detection on the IR signal
+    # IR signal is typically used for heart rate detection in pulse oximetry
+    if 'IR' in df.columns:
+        # Normalize the IR signal
+        ir_signal = df['IR'].values
+        normalized_ir = (ir_signal - np.mean(ir_signal)) / np.std(ir_signal)
+        
+        # Apply a bandpass filter (0.5-5 Hz, typical heart rate range of 30-300 BPM)
+        fs = 1000 / np.mean(df['time_diff'].dropna())  # Sampling frequency in Hz
+        low = 0.5 / (fs/2)  # Normalize by Nyquist frequency
+        high = 5.0 / (fs/2)
+        b, a = signal.butter(3, [low, high], btype='band')
+        filtered_ir = signal.filtfilt(b, a, normalized_ir)
+        
+        # Find peaks (R peaks)
+        peaks, _ = signal.find_peaks(filtered_ir, distance=fs/5)  # Min distance between peaks
+        
+        if len(peaks) > 0.01:
+            # Calculate intervals between peaks (in seconds)
+            peak_times = df['timestamp_ms'].iloc[peaks].values / 1000
+            rr_intervals = np.diff(peak_times)
+            
+            # Convert to heart rate (BPM)
+            heart_rates = 60 / rr_intervals
+            
+            # Filter out physiologically impossible values
+            valid_hr = heart_rates[(heart_rates >= 40) & (heart_rates <= 200)]
+            
+            if len(valid_hr) > 0:
+                hr_mean = np.mean(valid_hr)
+                hr_std = np.std(valid_hr)
+                hr_trend = np.polyfit(np.arange(len(valid_hr)), valid_hr, 1)[0] if len(valid_hr) > 2 else 0
+                hr_max_delta = np.max(valid_hr) - np.min(valid_hr) if len(valid_hr) > 1 else 0
+                
+                # Calculate RMSSD (Root Mean Square of Successive Differences)
+                rmssd = np.sqrt(np.mean(np.square(np.diff(rr_intervals)))) if len(rr_intervals) > 1 else 0
+            else:
+                hr_mean = hr_std = hr_trend = hr_max_delta = rmssd = np.nan
+        else:
+            hr_mean = hr_std = hr_trend = hr_max_delta = rmssd = np.nan
+    else:
+        hr_mean = hr_std = hr_trend = hr_max_delta = rmssd = np.nan
+    
+    # Compile features
     features = {
         'hr_mean': hr_mean,
         'hr_std': hr_std,
@@ -73,35 +93,18 @@ def extract_hr_from_fNIRS_with_timestamps(ppg_window, sampling_rate):
         'hr_max_delta': hr_max_delta,
         'rmssd': rmssd
     }
-
+    
     return features
 
 
+def main():
+    # Example usage
+    data_file = "Isha_music.csv"  # Replace with your data file
+    features = extract_fnirs_features(data_file)
+    print("Extracted features:")
+    for feature, value in features.items():
+        print(f"{feature}: {value}")
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python extract_hr_from_fNIRS_csv.py <path_to_csv> [sampling_rate]")
-        sys.exit(1)
-
-    csv_file = sys.argv[1]
-    sampling_rate = int(sys.argv[2]) if len(sys.argv) > 2 else 50  # default 50Hz
-
-    try:
-        df = pd.read_csv(csv_file)
-
-        # Auto-adjust columns: 'us' → 'timestamp' and 'Ratio' → 'ppg_signal'
-        if {'us', 'Ratio'}.issubset(df.columns):
-            df = df.rename(columns={'us': 'timestamp', 'Ratio': 'ppg_signal'})
-            df['timestamp'] = df['timestamp'] / 1e6  # convert from microseconds to seconds
-        else:
-            raise ValueError("CSV must contain 'us' and 'Ratio' columns.")
-
-        # Run HR extraction
-        features = extract_hr_from_fNIRS_with_timestamps(df[['timestamp', 'ppg_signal']], sampling_rate)
-
-        if features:
-            print("Extracted HR Features:")
-            for key, value in features.items():
-                print(f"  {key}: {value:.2f}")
-
-    except Exception as e:
-        print("Error processing file:", e)
+    main()
